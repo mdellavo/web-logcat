@@ -1,0 +1,6 @@
+gevent
+gevent_websocket
+gevent_subprocess
+pyramid
+sqlalchemy
+git+git://github.com/mdellavo/athanor.git#egg=athanor
