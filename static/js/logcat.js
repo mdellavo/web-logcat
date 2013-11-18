@@ -13,6 +13,7 @@ function disableSelection(element) {
 }
 
 var Message = Backbone.Model.extend({});
+var StatusMessage = Backbone.Model.extend({});
 
 var MessageList = Backbone.Collection.extend({
     model: Message
@@ -29,6 +30,17 @@ var Line = Backbone.View.extend({
     }
 });
 
+var StatusLine = Backbone.View.extend({
+    className: 'line status-line',
+    tagName: 'tr',
+    events: {},
+    template: _.template('<td colspan="3">{{ status }}</td>'),
+    render: function() {
+        this.$el.html(this.template(this.model.attributes));
+        return this;
+    }
+});
+
 var Console = Backbone.View.extend({
     className: "console",
     events: {
@@ -39,15 +51,24 @@ var Console = Backbone.View.extend({
     },
 
     initialize: function() {
-        this.listenTo(this.collection, "add", this.append);
+        this.listenTo(this.collection, "add", this.addLine);
     },
 
     template: _.template('<div class="title">{{ title }}</div><div class="content"><table></table></div>'),
 
     append: function(line) {
-        var line = new Line({model: line});
         this.$('.content table').append(line.render().$el);
         this.$('.content').scrollTop(this.$('.content').get(0).scrollHeight);
+    },
+
+    addLine: function(line) {
+        var line = new Line({model: line});
+        this.append(line);
+    },
+
+    setStatus: function(status) {
+        var statusLine = new StatusLine({model: status});
+        this.append(statusLine);
     },
 
     render: function() {
@@ -86,6 +107,13 @@ var Console = Backbone.View.extend({
 
 });
 
+function reconnect(view) {
+    window.setTimeout(function() {
+        console.log("reconnecting");
+        connect(view);
+    },500);
+}
+
 function connect(view) {
     var socket = new WebSocket("ws://localhost:8000/logcat");
 
@@ -99,15 +127,19 @@ function connect(view) {
 
     socket.onerror = function() {
         console.log('socket error!', arguments);
-        window.setTimeout(function() {
-            console.log("reconnecting");
-            connect(view);
-        },500);
+        reconnect(view);
     };
 
     socket.onmessage = function(e) {
-        console.log('message', arguments);
-        view.collection.add(JSON.parse(e.data));
+        var msg = JSON.parse(e.data);
+
+        console.log('message', msg);
+
+        if (msg.type == 'log')
+            view.collection.add(msg.payload);
+        if (msg.type == 'status')
+            view.setStatus(new StatusMessage(msg.payload));
+
     };
 }
 

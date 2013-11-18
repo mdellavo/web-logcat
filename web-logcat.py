@@ -1,3 +1,4 @@
+from datetime import date, datetime
 import json
 from wsgiref.simple_server import make_server
 from gevent import monkey, sleep
@@ -20,6 +21,9 @@ import sys
 import time
 import logging
 
+build_message = lambda type, **kwargs: dict(type=type, payload=kwargs)
+log_message = lambda data: build_message('log', **data)
+status_message = lambda status: build_message('status', status=status)
 
 def get_engine():
     return create_engine('sqlite:///:memory:',
@@ -30,7 +34,8 @@ def get_engine():
 class Message(Base):
     __tablename__ = 'messages'
 
-    id = Column(Integer, primary_key=True)
+    timestamp = Column(Integer, primary_key=True)
+    seq = Column(Integer, primary_key=True, autoincrement=True)
     date = Column(String)
     time = Column(String)
     pid = Column(String)
@@ -42,12 +47,12 @@ class Message(Base):
 clean_lines = lambda lines: (line.strip() for line in lines)
 
 header_pattern = re.compile(r'\[ (?P<date>\d\d-\d\d) (?P<time>\d\d:\d\d:\d\d\.\d\d\d)\s+(?P<pid>\d+):\s*(?P<tid>\d+) (?P<level>\w)\/(?P<tag>\w+) \]')
+waiting_pattern = re.compile(r'-\swaiting\sfor\sdevice\s-')
 
 Listeners = set()
 
 def start_logcat():
-    p = subprocess.Popen(['env', 'adb', 'logcat', '-v', 'long'], stdout=subprocess.PIPE, bufsize=1)
-    return clean_lines(p.stdout)
+    return subprocess.Popen(['env', 'adb', 'logcat', '-v', 'long'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
 
 def try_next(i):
     try:
@@ -72,11 +77,13 @@ def rate(log, iterable, period=10):
 
         yield obj
 
-def process_logcat(logcat):
+def process_logcat_stdout(logcat):
+    lines = clean_lines(logcat.stdout)
 
+    seq = 0
     while True:
 
-        line = try_next(logcat)
+        line = try_next(lines)
 
         if line is None:
             break
@@ -84,26 +91,74 @@ def process_logcat(logcat):
         m = header_pattern.match(line)
         if m:
             data = m.groupdict()
-            data['message'] = try_next(logcat)
+            t = '%s-%s %s' % (date.today().year, data['date'], data['time'])
+            d = datetime.strptime(t, '%Y-%m-%d %H:%M:%S.%f')
+            t = (time.mktime(d.timetuple()) * 1000) + (d.microsecond / 1000)
+            data['timestamp'] = t
+            data['message'] = try_next(lines)
+            seq += 1
+            data['seq'] = seq
             yield data
+
+def fanout(message):
+    for listener in Listeners:
+        listener.put(message)
+
+def store_message(session, message):
+    m = Message(**message)
+    session.add(m)
+    session.commit()
+
+def process_logout_stderr(logcat):
+    lines = clean_lines(logcat.stderr)
+
+    log = logging.getLogger('logcat-stderr-reader')
+
+    log.info('started')
+    while True:
+
+        line = try_next(lines)
+        if line is None:
+            break
+
+        m = waiting_pattern.match(line)
+        if m:
+            log.info('waiting for adb')
+            fanout(status_message('waiting for device...'))
+
+    log.info('finished')
 
 def logcat_main():
 
-    log = logging.getLogger('logcat')
-    log.info('starting adb...')
+    log = logging.getLogger('logcat-main')
 
-    logcat = start_logcat()
-    messages = rate(log, process_logcat(logcat))
+    last = 0
+    while True:
+        log.info('starting adb...')
+        logcat = start_logcat()
 
-    session = Session()
+        fanout(status_message('ADB started...'))
 
-    for message in messages:
-        m = Message(**message)
-        session.add(m)
-        session.commit()
+        gevent.spawn(process_logout_stderr, logcat)
 
-        for listener in Listeners:
-            listener.put(message)
+        messages = rate(log, process_logcat_stdout(logcat))
+
+        session = Session()
+
+        for message in messages:
+
+            if message['timestamp'] < last:
+                continue
+
+            last = max(last, message['timestamp'])
+
+            store_message(session, message)
+            fanout(log_message(message))
+
+        logcat.wait()
+
+        log.info('logcat finished with retcode = %s', logcat.returncode)
+        fanout(status_message('ADB terminated, restarting'))
 
 
 @view_config(route_name='root', renderer='base.mako')
